@@ -26,12 +26,14 @@
  */
 
 typedef union header {
-  /* TODO: add a pointer in the header to the last address that
-   * marked the data in the previous collection cycle. Also, adding
-   * an "atomic" flag would be good. 
-   */
   struct {
-    _Bool marked; /* Screw single bits! */
+    union {
+      struct {
+	unsigned int marked : 1;
+	unsigned int atomic : 1;
+      };
+      char pad;
+    };
     size_t size;
     void **prev_reff;
     union header *next;
@@ -48,6 +50,7 @@ size_t GC_heap_size = 0; /* The heap size, in blocks. */
 void GCFree (void *);
 static header_t *morecore (size_t);
 static void add_to_free_list (header_t *);
+static void mark_from_heap (header_t *);
 
 void GCInit (void)
 {
@@ -72,10 +75,12 @@ void GCInit (void)
   base.size = 0;
 }
 
+/*
 _init (void)
 {
   GCInit ();
 }
+*/
 
 void *GCMalloc (size_t alloc_size)
 {
@@ -115,6 +120,15 @@ void *GCMalloc (size_t alloc_size)
   }
 }
 
+void *GCMallocAtomic (size_t size)
+{
+  void *p;
+
+  p = GCMalloc (size);
+  ((header_t *) (p - 1))->atomic = true;
+  return p;
+}
+
 void *GCRealloc (void *ap, size_t new_size)
 {
   void *np;
@@ -131,11 +145,12 @@ void *GCRealloc (void *ap, size_t new_size)
   return np;
 }
 
+
 void GCollect (void)
 {
   _Bool unmarked;
-  header_t *p, *pm, *prevp;
-  unsigned long i, j, stack_top;
+  header_t *p, *prevp;
+  unsigned long i, stack_top;
   extern unsigned long etext, end; /* Don't need edata. */
 
   if (usedp == NULL)
@@ -170,33 +185,17 @@ void GCollect (void)
      */
     unmarked = false;
     for (p = usedp->next;; p = p->next) {
-      if (!p->marked) { /* The current block is unmarked. */
+      if (!p->marked) {
 	if (*((void **) (stack_bottom - i)) >= (void *) (p + 1) &&
 	    *((void **) (stack_bottom - i)) <= (void *) (p + p->size + 1)) {
-	  /* Mark the item and check its memory. */
 	  p->marked = true;
 	  p->prev_reff = (void **) (stack_bottom - i);
-	  for (j = (unsigned long) (p + 1); j < ((unsigned long) p + p->size + 1); j++) {
-	    for (pm = usedp->next;; pm = pm->next) {
-	      if (!pm->marked) {
-		if (*((void **) j) >= (void *) (pm + 1) &&
-		    *((void **) j) <= (void *) (pm + pm->size + 1)) {
-		  pm->marked = true;
-		  break;
-		} else
-		  unmarked = true;
-	      }
-	      if (pm == usedp) {
-		if (!unmarked)
-		  return; /* Everything is marked! Yay! */
-		break;
-	      }
-	    }
-	  }
-	  break;
+	  if (!p->atomic)
+	    mark_from_heap (p);
 	} else
-	  unmarked = true; /* There were some unmarked items. */
-      }
+	  unmarked = true;
+	break;
+      } 
       if (p == usedp) {
 	if (!unmarked)
 	  return;
@@ -218,27 +217,12 @@ void GCollect (void)
 	    *((void **) i) <= (void *) (p + p->size + 1)) {
 	  p->marked = true;
 	  p->prev_reff = (void **) i;
-	  for (j = (unsigned long) (p + 1); j < ((unsigned long) p + p->size + 1); j++) {
-	    for (pm = usedp->next;; pm = pm->next) {
-	      if (!pm->marked) {
-		if (*((void **) j) >= (void *) (pm + 1) &&
-		    *((void **) j) <= (void *) (pm + pm->size + 1)) {
-		  pm->marked = true;
-		  break;
-		} else
-		  unmarked = true;
-	      }
-	    }
-	    if (pm == usedp) {
-	      if (!unmarked)
-		return;
-	      break;
-	    }
-	  }
-	}
+	  if (!p->atomic)
+	    mark_from_heap (p);
+	} else
+	  unmarked = true;
 	break;
-      } else
-	unmarked = true;
+      }
       if (p == usedp) {
 	if (!unmarked)
 	  return;
@@ -270,6 +254,29 @@ void GCollect (void)
     p->marked = false;
     if (p == usedp)
       break;
+  }
+}
+
+static void mark_from_heap (header_t *p)
+{
+  header_t *pm;
+  unsigned long i;
+  
+  if (p->atomic)
+    return;
+  for (i = (unsigned long) (p + 1); i < ((unsigned long) p + p->size + 1); i++) {
+    for (pm = usedp->next;; pm = pm->next) {
+      if (!pm->marked && p != pm) {
+	if (*((void **) i) >= (void *) (pm + 1) &&
+	    *((void **) i) <= (void *) (pm + pm->size + 1)) {
+	  pm->marked = true;
+	  mark_from_heap (pm);
+	  break;
+	} 
+      }
+      if (pm == usedp)
+	return;
+    }
   }
 }
 
